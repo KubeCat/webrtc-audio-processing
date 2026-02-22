@@ -71,6 +71,47 @@ fn prefix_archive_symbols(
     Ok(())
 }
 
+/// Rewrite `#[link_name]` attributes in the bindgen output so that symbols from the
+/// webrtc library reference their prefixed names (matching `prefix_archive_symbols`).
+fn prefix_binding_link_names(
+    binding_file: &std::path::Path,
+    renamed_symbols: &[String],
+    prefix: &str,
+) -> Result<()> {
+    if renamed_symbols.is_empty() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(binding_file)
+        .context("reading bindings for link_name prefixing")?;
+
+    let renamed: std::collections::HashSet<&str> =
+        renamed_symbols.iter().map(|s| s.as_str()).collect();
+
+    // Bindgen emits link_name = "\u{1}MANGLED" where \u{1} is a literal escape in the
+    // source text (not a resolved byte). Match these attributes and prefix any symbol
+    // that was renamed in the static library.
+    let re = regex::Regex::new(r#"link_name\s*=\s*"\\u\{1\}([^"]+)""#)
+        .context("compiling link_name regex")?;
+
+    let result = re.replace_all(&content, |caps: &regex::Captures| {
+        let symbol = caps.get(1).unwrap().as_str();
+        if renamed.contains(symbol) {
+            format!("link_name = \"\\u{{1}}{}{}\"", prefix, symbol)
+        } else {
+            caps[0].to_string()
+        }
+    });
+
+    if result != content {
+        eprintln!("Prefixed link_name attributes in bindings with '{}'", prefix);
+        std::fs::write(binding_file, result.as_ref())
+            .context("writing prefixed bindings")?;
+    }
+
+    Ok(())
+}
+
 #[cfg(not(feature = "bundled"))]
 mod webrtc {
     use super::*;
@@ -218,6 +259,21 @@ mod webrtc {
             meson.arg(format!("-Dcpp_link_args={}", link_args));
         }
 
+        // For cross-compilation: generate a Meson cross file so Meson uses the
+        // correct target compiler (e.g. NDK clang for Android).
+        let target = env::var("TARGET").unwrap_or_default();
+        let host = env::var("HOST").unwrap_or_default();
+        if target != host && !target.is_empty() {
+            let cross_file = out_dir().join("meson-cross.ini");
+            if let Ok(cross_content) = generate_meson_cross_file(&target) {
+                std::fs::write(&cross_file, &cross_content)
+                    .context("Failed to write Meson cross file")?;
+                meson.arg("--cross-file");
+                meson.arg(cross_file.to_str().unwrap());
+                eprintln!("Using Meson cross file for target: {}", target);
+            }
+        }
+
         let status = meson
             .arg("-Ddefault_library=static")
             .arg(webrtc_build_dir.as_os_str())
@@ -288,6 +344,78 @@ mod webrtc {
 
     fn webrtc_build_dir() -> PathBuf {
         out_dir().join("webrtc-audio-processing-build")
+    }
+
+    fn generate_meson_cross_file(target: &str) -> Result<String> {
+        let ndk_home = env::var("ANDROID_NDK_HOME")
+            .or_else(|_| env::var("ANDROID_NDK_ROOT"))
+            .unwrap_or_else(|_| "/opt/android-ndk".into());
+        let prebuilt = format!("{}/toolchains/llvm/prebuilt/linux-x86_64", ndk_home);
+
+        let (cpu, cpu_family, system, clang_target) = if target.starts_with("aarch64-linux-android") {
+            ("aarch64", "aarch64", "android", "aarch64-linux-android")
+        } else if target.starts_with("armv7-linux-androideabi") {
+            ("armv7a", "arm", "android", "armv7a-linux-androideabi")
+        } else if target.starts_with("x86_64-linux-android") {
+            ("x86_64", "x86_64", "android", "x86_64-linux-android")
+        } else if target.starts_with("i686-linux-android") {
+            ("i686", "x86", "android", "i686-linux-android")
+        } else {
+            bail!("Unsupported Android target: {}", target);
+        };
+
+        let api_level = env::var("CARGO_NDK_ANDROID_PLATFORM")
+            .ok()
+            .and_then(|p| p.strip_prefix("android-").map(String::from))
+            .or_else(|| {
+                let suffix = target.strip_prefix("aarch64-linux-android")
+                    .or_else(|| target.strip_prefix("armv7-linux-androideabi"))
+                    .or_else(|| target.strip_prefix("x86_64-linux-android"))
+                    .or_else(|| target.strip_prefix("i686-linux-android"));
+                suffix.and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) })
+            })
+            .unwrap_or_else(|| "28".into());
+
+        let cc = format!("{}/bin/{}{}{{api}}-clang", prebuilt, clang_target, "")
+            .replace("{api}", &api_level);
+        let cxx = format!("{}/bin/{}{}{{api}}-clang++", prebuilt, clang_target, "")
+            .replace("{api}", &api_level);
+        let ar = format!("{}/bin/llvm-ar", prebuilt);
+        let strip = format!("{}/bin/llvm-strip", prebuilt);
+
+        if !Path::new(&cc).exists() {
+            let alt_cc = format!("{}/bin/clang", prebuilt);
+            if Path::new(&alt_cc).exists() {
+                return Ok(format!(
+                    "[binaries]\n\
+                     c = ['{alt_cc}', '--target={clang_target}{api_level}']\n\
+                     cpp = ['{alt_cc}++', '--target={clang_target}{api_level}']\n\
+                     ar = '{ar}'\n\
+                     strip = '{strip}'\n\
+                     \n\
+                     [host_machine]\n\
+                     system = '{system}'\n\
+                     cpu_family = '{cpu_family}'\n\
+                     cpu = '{cpu}'\n\
+                     endian = 'little'\n"
+                ));
+            }
+            bail!("NDK compiler not found: {}", cc);
+        }
+
+        Ok(format!(
+            "[binaries]\n\
+             c = '{cc}'\n\
+             cpp = '{cxx}'\n\
+             ar = '{ar}'\n\
+             strip = '{strip}'\n\
+             \n\
+             [host_machine]\n\
+             system = '{system}'\n\
+             cpu_family = '{cpu_family}'\n\
+             cpu = '{cpu}'\n\
+             endian = 'little'\n"
+        ))
     }
 
     /// Extract defined (non-external) symbols from a static library using nm.
@@ -438,6 +566,68 @@ fn main() -> Result<()> {
         // Rust edition 2024 warns on usafe operations outside unsafe block, even in unsafe fns.
         .wrap_unsafe_ops(true);
 
+    // For Android cross-compilation: suppress host C++ headers and use NDK sysroot.
+    // Without this, the host's glibc headers leak __GLIBC__ macros into the NDK's
+    // libc++ __config, causing _LIBCPP_HAS_COND_CLOCKWAIT=1 (needs API 30+).
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("android") {
+        let ndk_home = env::var("ANDROID_NDK_HOME")
+            .or_else(|_| env::var("ANDROID_NDK_ROOT"))
+            .unwrap_or_else(|_| "/opt/android-ndk".into());
+        let sysroot = format!(
+            "{}/toolchains/llvm/prebuilt/linux-x86_64/sysroot",
+            ndk_home
+        );
+
+        // Extract API level from target triple (e.g. aarch64-linux-android28 -> 28)
+        let api_level = env::var("CARGO_NDK_ANDROID_PLATFORM")
+            .ok()
+            .and_then(|p| p.strip_prefix("android-").map(String::from))
+            .or_else(|| {
+                target
+                    .strip_prefix("aarch64-linux-android")
+                    .or_else(|| target.strip_prefix("armv7-linux-androideabi"))
+                    .or_else(|| target.strip_prefix("x86_64-linux-android"))
+                    .or_else(|| target.strip_prefix("i686-linux-android"))
+                    .and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) })
+            })
+            .unwrap_or_else(|| "28".into());
+
+        // Use the NDK's clang builtins (not system clang) for consistent headers.
+        let ndk_clang_builtins = format!(
+            "{}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang",
+            ndk_home
+        );
+        let clang_version = std::fs::read_dir(&ndk_clang_builtins)
+            .ok()
+            .and_then(|mut d| {
+                d.find_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            })
+            .unwrap_or_else(|| "21".into());
+
+        let arch = if target.starts_with("aarch64") {
+            "aarch64-linux-android"
+        } else if target.starts_with("armv7") {
+            "arm-linux-androideabi"
+        } else if target.starts_with("x86_64") {
+            "x86_64-linux-android"
+        } else {
+            "i686-linux-android"
+        };
+
+        // Order matters: libc++ → clang builtins → target C headers → general C headers
+        builder = builder
+            .clang_arg("-nostdinc")
+            .clang_arg("-nostdinc++")
+            .clang_arg(format!("--target={}{}", arch, api_level))
+            .clang_arg(format!("-isystem{}/usr/include/c++/v1", sysroot))
+            .clang_arg(format!("-isystem{}/{}/include", ndk_clang_builtins, clang_version))
+            .clang_arg(format!("-isystem{}/usr/include/{}", sysroot, arch))
+            .clang_arg(format!("-isystem{}/usr/include", sysroot));
+
+        eprintln!("Android bindgen: target={}, api={}, sysroot={}", target, api_level, sysroot);
+    }
+
     builder = builder
         // Transitive dependencies are automatically included.
         .allowlist_function("webrtc_audio_processing_wrapper::.*")
@@ -456,6 +646,8 @@ fn main() -> Result<()> {
         .expect("Unable to generate bindings")
         .write_to_file(&binding_file)
         .expect("Couldn't write bindings!");
+
+    prefix_binding_link_names(&binding_file, &renamed_symbols, SYMBOL_PREFIX)?;
 
     Ok(())
 }
